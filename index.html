@@ -4,7 +4,7 @@
   <head>
     <meta charset='utf-8'>
     <meta http-equiv="X-UA-Compatible" content="chrome=1">
-    <meta name="description" content="fsneak的博客-首页 : fsneak的博客">
+    <meta name="description" content="fsneak的博客-首页 : ">
 
     <link rel="stylesheet" type="text/css" media="screen" href="stylesheets/stylesheet.css">
 
@@ -19,7 +19,7 @@
           <a id="forkme_banner" href="https://github.com/fsneak">View on GitHub</a>
 
           <h1 id="project_title">fsneak的博客-首页</h1>
-          <h2 id="project_tagline">fsneak的博客</h2>
+          <h2 id="project_tagline"></h2>
 
         </header>
     </div>
@@ -28,11 +28,128 @@
     <div id="main_content_wrap" class="outer">
       <section id="main_content" class="inner">
         <h1>
-<a id="fsneakgithubio" class="anchor" href="#fsneakgithubio" aria-hidden="true"><span aria-hidden="true" class="octicon octicon-link"></span></a>fsneak.github.io</h1>
+<a id="任务顺序执行机制" class="anchor" href="#%E4%BB%BB%E5%8A%A1%E9%A1%BA%E5%BA%8F%E6%89%A7%E8%A1%8C%E6%9C%BA%E5%88%B6" aria-hidden="true"><span aria-hidden="true" class="octicon octicon-link"></span></a>任务顺序执行机制</h1>
 
-<p>fsneak的博客</p>
+<h2>
+<a id="使用队列顺序执行任务" class="anchor" href="#%E4%BD%BF%E7%94%A8%E9%98%9F%E5%88%97%E9%A1%BA%E5%BA%8F%E6%89%A7%E8%A1%8C%E4%BB%BB%E5%8A%A1" aria-hidden="true"><span aria-hidden="true" class="octicon octicon-link"></span></a>使用队列顺序执行任务</h2>
+
+<p>公司前人留下来了一个工具类<code>MultiThreadQueueWorker</code>。
+作用是作为一个任务执行器，保证放入执行器中的同类型任务都是顺序执行，并且不需要为每种类型的任务都生成一个线程去执行。
+该执行器的内部仍然是为每种类型的任务创建一个队列，每次新加的任务都会放入到队列中去。
+但是在创建队列的同时，该执行器还会将队列的key放入一个阻塞队列keyQueue中。
+各个线程去抢占keyQueue中的key，抢到key的线程才执行相应任务队列的第一个任务，执行完后再将key放回keyQueue中，等待下一次线程的抢占。
+大致代码如下：</p>
+
+<pre><code>public void accept(String key, Task task) {
+    if(!taskQueueMap.containsKey(key)) {
+        Queue ret = taskQueueMap.putIfAbsent(key, new Queue());
+        if(ret == null) {
+            keyQueue.offer(key);
+        }
+    }
+
+    Queue queue = taskQueue.get(key);
+    queue.add(task);
+}
+
+public void process() {
+    // invoked by every worker thread
+    while(running) {
+        String key = keyQueue.take();
+        Queue queue = taskQueue.get(key);
+        Task task = queue.poll();
+        task.execute();
+        keyQueue.offer(key);
+    }
+}
+</code></pre>
+
+<p>而实际代码当然更为复杂，还需要处理各种同步的情况，队列为空的时候要把key从keyQueue中移除，有任务了再把它加回去等等。
+这导致这个类的代码维护比较困难，事实上也出现了由于任务执行报错导致key没有放回keyQueue，致使该key对应的任务队列永远不会再被执行的bug。</p>
+
+<p>此外，由于这个类缺乏对于空队列的回收机制，如果对于每种类型都创建一个队列，则队列数量可能会有上万或者十几万个，而其中有可能大部分都是空的。
+所以实际运用时往往会控制队列的数量，使用某种方式将多个key映射到同一个队列上（哈希）。
+这就额外增加了任务执行顺序的条件。
+比如如果类型A和B都映射到队列1上，而某个A任务执行时间较长（比如IO操作、网络拥塞等），排在该任务后面的B任务都会受到影响无法立即执行。
+哪怕A任务和B任务之间没有业务逻辑上的关系。</p>
+
+<p>基于上述原因，我比较想用一些已有的稳定的机制替换<code>MultiThreadQueueWorker</code>。
+但是在我的印象中，想到的要么是为一个每一个队列安排一个线程（那样要么会生成大量线程，要么要将不同类型的任务安排在同一个队列中），要么就是变成上述的类似机制。</p>
+
+<p>最后，果然还是<strong>万能的StackOverflow</strong>救了我。</p>
+
+<h2>
+<a id="使用future保证任务的顺序执行" class="anchor" href="#%E4%BD%BF%E7%94%A8future%E4%BF%9D%E8%AF%81%E4%BB%BB%E5%8A%A1%E7%9A%84%E9%A1%BA%E5%BA%8F%E6%89%A7%E8%A1%8C" aria-hidden="true"><span aria-hidden="true" class="octicon octicon-link"></span></a>使用Future保证任务的顺序执行</h2>
+
+<p>StackOverflow的地址<a href="http://stackoverflow.com/questions/29889885/java-divide-incoming-work-uniformly-via-hashing-in-multithreaded-evnironments/29893297#29893297">在此</a>。</p>
+
+<p>文章提供了两种解决方案。</p>
+
+<ul>
+<li>基于Java8</li>
+</ul>
+
+<pre><code>ConcurrentMap&lt;String, CompletableFuture&lt;Void&gt;&gt; dispatchQueues = ...
+
+public CompletableFuture&lt;Void&gt; dispatch(String queueName, Runnable task) {
+  return dispatchQueues.compute(queueName, (k, queue) -&gt; {
+    return (queue == null)
+        ? CompletableFuture.runAsync(task)
+        : queue.thenRunAsync(task);
+  });
+}
+</code></pre>
+
+<ul>
+<li>基于Guava</li>
+</ul>
+
+<pre><code>ListeningExecutorService executor = MoreExecutors.listeningDecorator(Executors.newCachedThreadPool());
+Striped&lt;Lock&gt; locks = Striped.lock(256);
+ConcurrentMap&lt;String, ListenableFuture&lt;?&gt;&gt; dispatchQueues = new ConcurrentHashMap&lt;String, ListenableFuture&lt;?&gt;&gt;();
+
+public ListenableFuture&lt;?&gt; dispatch(String queueName, final Runnable task) {
+    Lock lock = locks.get(queueName);
+    lock.lock();
+    try {
+        ListenableFuture&lt;?&gt; future = dispatchQueues.get(queueName);
+        if (future == null) {
+            future = executor.submit(task);
+        } else {
+            final SettableFuture&lt;Void&gt; next = SettableFuture.create();
+            future.addListener(new Runnable() {
+                @Override
+                public void run() {
+                    try {
+                        task.run();
+                    } finally {
+                        next.set(null);
+                    }
+                }
+            }, executor);
+
+            future = next;
+        }
+        dispatchQueues.put(queueName, future);
+        return future;
+    }
+    finally {
+        lock.unlock();
+    }
+}
+</code></pre>
+
+<p>代码不同但是原理是类似的，即Future运行完成后的回调机制。
+首先创建一个Map用于存放任务类型和对应Future。
+提交任务时，如果Map中没有该任务对应的Future，则将任务提交给线程池后把返回的Future放入Map中。
+当有对应的Future时，则将要执行的任务注册到Future的回调中，并且使用注册后返回的Future替换Map中已有的Future。
+这样，实际上形成了一个<strong>任务链表</strong>，而Map中存储的总是该类型的最后一个任务。
+这样既保证了任务的先后执行顺序，也没有将任务类型和线程绑定，各个类型任务之间相互独立。
+又由于没有用显示的容器去存储任务，任务执行完后也就不会有其他的空间开销。
+可以说从各个方面都解决了上述使用显示的队列去保证任务顺序执行时带来的难题！</p>
+
+<p>有感而发，故写下了这篇文章。</p>
       </section>
-  第一次用GitHub的博客。先学习学习测试测试。
     </div>
 
     <!-- FOOTER  -->
@@ -41,5 +158,8 @@
         <p>Published with <a href="https://pages.github.com">GitHub Pages</a></p>
       </footer>
     </div>
+
+    
+
   </body>
 </html>
